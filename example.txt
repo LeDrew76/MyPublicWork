@@ -1,2 +1,6 @@
 Space for example code
+<<<<<<< HEAD
 but i really really think this should be in the code
+=======
+Testing from JM
+>>>>>>> 355c13fa44a222ecfb666a7dd3e4323bb594de00

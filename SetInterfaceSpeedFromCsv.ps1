@@ -1,8 +1,10 @@
 # Running Variables - You may need to change these
-$orionhostname = '1.2.3.4'
-$sqlInstance = '1.2.3.5'
-# how wide of a range of polling loads do we want to allow before nodes get moved?
-$loadDelta = "10"
+$csvPath = "E:\Scripts\something.csv"
+
+
+$hostname1 = '1.2.3.4'
+$hostname2 = '1.2.3.6'
+$hostname3 = '1.2.3.7'
 
 #####-----------------------------------------------------------------------------------------#####
 #region Logging
@@ -117,79 +119,121 @@ if( $creds.OrionApi.GetType().Name -ne "PSCredential" ) {
 
 
 # create a connection to the SolarWinds API
-$swis = connect-swis -host $orionhostname -credential $($creds.OrionApi)
-$swisTest =  get-swisdata $swis "SELECT TOP 1 servername FROM Orion.Websites"
+$orionHostnames = $($hostname1,$hostname2,$hostname3)
+$swisHash = @{}
+foreach( $orion in $orionHostnames ) {
+    $swis = connect-swis -host $orion -credential $($creds.OrionApi)
+    $swisTest =  get-swisdata $swis "SELECT TOP 1 servername FROM Orion.Websites"
 
-"Testing Connection to Orion"
-if ( !$swisTest ) { 
-    "Unable to connect to Orion server $orionhostname as $($creds.OrionApi.UserName)"
-    Stop-Transcript
-    exit 1
+    "Testing Connection to Orion"
+    if ( !$swisTest ) { 
+        "Unable to connect to Orion server $orion as $($creds.OrionApi.UserName)"
+        Stop-Transcript
+        exit 1
+    }
+
+    "Connected to $orion successfully as $($creds.OrionApi.UserName)"
+    $swisHash[$orion] = $swis
 }
-
-"Connected to $orionhostname successfully as $($creds.OrionApi.UserName)"
 
 #endregion Connections
 #####-----------------------------------------------------------------------------------------#####
 #region Execution
 
+# Get a list of interfaces with custom bandwidth to set
+$csvNodes = $null
+"Beginning work with $csvPath"
 
-$query = @"
-select top 1 n.uri, n.caption, e.HighServer, e.HighEngine, e.HighUsage, count(n.uri) as [Elements], low.LowServer, low.LowEngine, low.LowUsage, (e.HighUsage-low.LowUsage) as LoadDelta
-from orion.nodes n
-join (select top 1 p.engine.Servername as HighServer, engineid as HighEngine,case when p.engine.servertype = 'Primary' then (isnull(p.currentusage,0) * 4) else isnull(p.currentusage,0) end as HighUsage from orion.PollingUsage p where scalefactor='orion.standard.polling' order by HighUsage desc) e on e.HighEngine=n.engineid
-join (select 
-n.uri
-from orion.nodes n
-union all 
-(select i.node.uri
-from orion.npm.Interfaces i)
-union all 
-(select v.node.uri
-from orion.volumes v)) c on c.uri=n.uri
-join (
-select top 1 e.servername as LowServer, e.engineid as LowEngine, case when p.engine.servertype = 'Primary' then (isnull(p.currentusage,0) * 4) else isnull(p.currentusage,0) end as LowUsage 
-from Orion.Engines e
-left join orion.PollingUsage p on p.EngineID = e.EngineID and scalefactor='orion.standard.polling' 
-order by LowUsage
-) low on low.Lowengine != n.engineid
-Where e.HighUsage-low.LowUsage > $loadDelta
-and n.objectsubtype != 'Agent'
-group by n.uri, n.caption, e.HighEngine, e.HighUsage, low.LowEngine, low.LowUsage, e.HighServer, low.LowServer
-order by [Elements] desc
+$csvNodes = import-csv $csvPath #| select -ExpandProperty "IP Address"
+if ( !$csvNodes ) { 
+    "Unable to find file at $csvPath"
+    Stop-Transcript
+    exit 1
+}
+#this code converts the arrays into an indexed hash tables for performance
+"Building CSV hash table"
+$csvHash = @{}
+foreach( $item in $csvNodes ) {
+    $identifier = "$($item.Hostname.replace('.corp.company.com','').replace('.ap.company.com','').replace('.corp.eu.company.com','')),$($item.Interface.replace('Interface ','').replace(' ',','))"
+    $item | Add-Member -Name 'csvIdentifier' -Type NoteProperty -Value $identifier
+    $csvHash[$identifier] = $item
+}
+
+
+$orionHash = @{}
+foreach( $orion in $orionHostnames ) {
+    "Querying $orion"
+    # Get a list of hostnames and their current sitecode
+    $nodesQuery = @"
+    select n.Caption, ncp.SiteCode, ncp.Uri as NCPURI
+    , i.ifname, i.InterfaceIndex, i.CustomBandwidth,i.InBandwidth, i.OutBandwidth,i.uri as IURI
+    ,'$($orion)' as Orion
+
+    from orion.nodes n
+    join orion.NodesCustomProperties ncp on ncp.nodeid=n.nodeid
+    join orion.npm.Interfaces i on i.nodeid=n.nodeid
 "@
-
-# get highest engine and its largest node
-$polling = Get-SwisData $swis $query 
-
-# while the difference between those is more than the delta move nodes
-While ( $polling.LoadDelta -gt $loadDelta ) {
-    # move highnode to lowengine
-    "Moving $($polling.Caption) from $($polling.HighServer) to $($polling.LowServer)"
-    Set-SwisObject -SwisConnection $swis -Uri $polling.uri -properties @{EngineID = $polling.Lowengine}  
-    # let time pass for polling loads to update
-    Start-Sleep -s 15
-    # update Polling
-    $polling = Get-SwisData $swis $query
+    $orionNodes = Get-SwisData $swisHash[$orion] $nodesQuery
+    "Building $orion hash table"
+    foreach( $item in $orionNodes ) {
+        $identifier = "$($item.Caption.replace('.corp.company.com','').replace('.ap.company.com','').replace('.corp.eu.company.com','')),$($item.ifname),$($item.interfaceindex)"
+        $item | Add-Member -Name 'orionIdentifier' -Type NoteProperty -Value $identifier
+        $orionHash[$identifier] = $item
     }
+}
 
-"All engines are within $loadDelta % of each other, after adjusting for primary poller load"
+$unmatched = [System.Collections.Generic.List[string]]::new()
+#$test = "hostname,interface,ifindex"
+#foreach( $csvNode in $csvHash[$test] ) {
+foreach( $csvNode in $csvHash.Values ) {
+    $orionMatch = $orionHash[$csvNode.csvIdentifier]
+    if( $orionMatch ) {
+        "Found Match in Orion: $($orionMatch.orionIdentifier)"
 
-$results = Get-SwisData $swis @"
-select distinct e.HighEngine, e.HighEngineID, e.HighUsage, low.LowEngine, low.LowEngineID, low.LowUsage, (e.HighUsage-low.LowUsage) as LoadDelta
-from orion.engines n
-join (
-select top 1 p.Engine.ServerName as HighEngine, engineid as HighEngineID,case when p.engine.servertype = 'Primary' then (isnull(p.currentusage,0) * 4) else isnull(p.currentusage,0) end as HighUsage from orion.PollingUsage p where scalefactor='orion.standard.polling' order by HighUsage desc
-) e on e.HighEngineid=n.engineid
-left join (
-select top 1 e.servername as LowEngine, e.engineid as LowEngineID, case when p.engine.servertype = 'Primary' then (isnull(p.currentusage,0) * 4) else isnull(p.currentusage,0) end as LowUsage 
-from Orion.Engines e
-left join orion.PollingUsage p on p.EngineID = e.EngineID and scalefactor='orion.standard.polling' 
-order by LowUsage
-) low on low.LowEngineID != n.engineid
-"@
+        $device = [pscustomobject]@{
+            csvHostname = $csvNode.HostName.replace('corp.company.com','').replace('ap.company.com','').replace('corp.eu.company.com','')
+            csvSiteName = $csvNode.'Site Name'
+            csvInterface = $csvNode.Interface.split(' ')[1]
+            csvSpeedBps = ([long]$csvNode.'Total speed'*1000000)
+            csvIdentifier = $csvNode.csvIdentifier
+            orionIdentifier = $orionMatch.orionIdentifier
+            orionCaption = $orionMatch.Caption
+            orionSiteCode = $orionMatch.SiteCode
+            orionIfName = $orionMatch.ifname
+            orionInterfaceIndex = [long]$orionMatch.InterfaceIndex
+            orionCustomBandwidth = $orionMatch.CustomBandwidth
+            orionInBps = [long]$orionMatch.InBandwidth
+            orionOutBps = [long]$orionMatch.OutBandwidth
+            orionInstance = $orionMatch.Orion
+            orionIntUri = $orionMatch.IURI
+        }
 
-$results
+        $propsToChange = @{}
+        if( $device.orionCustomBandwidth -ne "True" ) {
+            "Enabling custom bandwidth in Orion"
+            $propsToChange.CustomBandwidth = "True"
+        }
+
+        if( $device.csvSpeedBps -ne $device.orionInBps -or $device.csvSpeedBps -ne $device.orionOutBps  ) {
+            "Setting custom bandwidth in Orion to $($device.csvSpeedBps) bps"
+            $propsToChange.InBandwidth = $device.csvSpeedBps
+            $propsToChange.OutBandwidth = $device.csvSpeedBps
+        }
+
+        if( $propsToChange.count -ne 0 ) {
+            $result = Set-SwisObject -swis $swisHash[$device.orionInstance] -Uri $device.orionIntUri -Properties $propsToChange
+        }
+
+    } else {
+        "No matching object monitored in Orion for $($csvNode.csvIdentifier)"
+        $unmatched.Add($csvNode.csvIdentifier)
+    }
+}
+
+if( $unmatched.Count -ne 0 ) {
+    "The following interfaces could not be matched"
+    $unmatched
+}
 
 #endregion Execution
 #####-----------------------------------------------------------------------------------------#####
